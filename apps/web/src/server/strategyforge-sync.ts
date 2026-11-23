@@ -31,8 +31,11 @@ export interface StrategyForgeDeal {
   account: string;
   server: string | null;
   login: number | string | null;
-  ticket: number;
-  position_id: number;
+  /** Decimal strings: cTrader rows use 63-bit ids beyond JavaScript's exact integers. */
+  ticket: string | number;
+  position_id: string | number;
+  /** StrategyForge's arrival sequence; orders fills that share a timestamp. */
+  seq?: number;
   side: "buy" | "sell";
   entry: "in" | "out" | "inout" | "out_by" | "unknown";
   symbol: string;
@@ -47,6 +50,9 @@ export interface StrategyForgeDeal {
 
 interface StrategyForgeAccount {
   account: string;
+  /** Prop account name and stage kind when the login is attached to a stage. */
+  name?: string | null;
+  stage?: string | null;
   server?: string | null;
   login?: number | string | null;
   currency?: string | null;
@@ -103,7 +109,11 @@ export const dealToExecution = (deal: StrategyForgeDeal): ImportedExecution | st
   if (!deal.symbol || !(deal.volume > 0) || !Number.isFinite(deal.price))
     return `Deal ${deal.ticket}: missing symbol, volume or price.`;
   if (!Number.isFinite(Date.parse(deal.executed_at))) return `Deal ${deal.ticket}: invalid time.`;
-  if (!Number.isSafeInteger(deal.ticket)) return `Deal ${deal.ticket}: invalid ticket.`;
+  const ticket = String(deal.ticket);
+  if (!/^\d+$/.test(ticket)) return `Deal ${ticket}: invalid ticket.`;
+  const sequence = Number.isSafeInteger(deal.seq) ? deal.seq! : Number(ticket);
+  if (!Number.isSafeInteger(sequence) || sequence < 0)
+    return `Deal ${ticket}: no usable sequence number.`;
   const effect = deal.entry === "in" ? "open" : "close";
   // An opening buy is long; a closing sell closes a long.
   const direction = (deal.side === "buy") === (effect === "open") ? "long" : "short";
@@ -111,9 +121,10 @@ export const dealToExecution = (deal: StrategyForgeDeal): ImportedExecution | st
     direction,
     effect,
     positionId: String(deal.position_id),
-    executionId: String(deal.ticket),
-    // Tickets increase with time, so they order fills that share a timestamp.
-    sequence: deal.ticket,
+    executionId: ticket,
+    // Arrival order (or the MT5 ticket, which increases with time) orders fills
+    // that share a timestamp.
+    sequence,
   } as const;
   const cost = -(num(deal.commission) + num(deal.swap) + num(deal.fee));
   const credit = cost < 0 ? -cost : 0;
@@ -147,6 +158,8 @@ const readJson = <T>(key: string, fallback: T): T => {
 
 const accountName = (info: StrategyForgeAccount | undefined, key: string): string => {
   const [server, login] = key.split("|");
+  if (info?.name) return info.stage ? `${info.name} · ${info.stage}` : info.name;
+  if (server === "ctrader") return `cTrader ${login ?? key}`;
   const label = info?.company || server;
   return `MT5 ${login ?? key}${label ? ` (${label})` : ""}`;
 };
@@ -165,7 +178,7 @@ const journalAccountFor = (
     .values({
       id,
       name: accountName(info, key),
-      broker: "StrategyForge MT5",
+      broker: "StrategyForge",
       kind: "import",
       currency: info?.currency?.trim().toUpperCase() || "USD",
       createdAt: nowIso(),
@@ -206,7 +219,7 @@ const readyFills = (
   const sorted = [...items].sort(
     (a, b) =>
       Date.parse(a.fill.executedAt) - Date.parse(b.fill.executedAt) ||
-      a.deal.ticket - b.deal.ticket,
+      (a.fill.importMetadata?.order ?? 0) - (b.fill.importMetadata?.order ?? 0),
   );
   for (const item of sorted) {
     const position = item.fill.importMetadata!.position!;
